@@ -1,10 +1,9 @@
 import os
-
-import numpy as np
-from tqdm import trange
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
+import itertools
 import json
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from transformers import BertModel, BertTokenizer
@@ -55,8 +54,10 @@ def make_vocab(word_set, variety_set, category_set):
         'tag_dict': tag_dict,
         'category_list': category_list,
         'category_dict': category_dict,
-        'polarity_list': ['NEU', 'POS', 'NEG'],
-        'polarity_dict': {'NEU': 0, 'POS': 1, 'NEG': 2},
+        'polarity_list': ['NEU', 'NEG', 'POS'],
+        'polarity_dict': {'NEU': 0, 'NEG': 1, 'POS': 2},
+        # 'polarity_list': list(range(1, 6)),
+        # 'polarity_dict': {i: i for i in list(range(1, 6))},
         # 'variety_list': variety_list,
         # 'variety_dict': variety_dict,
         'tokenizer': BertTokenizer.from_pretrained('/data/pretrained/bert-base-chinese/')
@@ -181,4 +182,168 @@ def load_ner_dataset(args):
     dev_set = NERDataset(args, dataset[n_train: n_train + n_dev], vocabs)
     test_set = NERDataset(args, dataset[n_train + n_dev:], vocabs)
     return train_set, dev_set, test_set, vocabs
+
+def sentence_polarity(polaritys):
+    if len(polaritys) == 0:
+        return 0
+    elif len(polaritys) == 1:
+        return 0
+    else:
+        return np.mean(polaritys)
+
+def create_quads(args, datas, vocabs):
+    sen_len = args['max_sen_len']
+    dataset = {
+        'tokens': [],
+        'token_ids': [],
+        'token_masks': [],
+        'ner_tag_ids': [],
+        'sen_polarity': [], # sentence_level
+        'quad_index': [], # [[head, tail], [], ..]
+    }
+    quads = {
+        'index': [], # 第几句
+        'aspects': [],
+        'opinions': [],
+        'category': [],
+        'polarity': [],
+    }
+    tokenizer = vocabs['tokenizer']
+
+    # quads
+    tag_dict = vocabs['tag_dict']
+    category_dict = vocabs['category_dict']
+    polarity_dict = vocabs['polarity_dict']
+    for idx, item in enumerate(datas):
+        tokens = item['tokens']
+        bert_tokens = tokenizer(tokens, padding = 'max_length', truncation = True, max_length = sen_len)
+        token_ids = bert_tokens['input_ids']
+        token_masks = bert_tokens['attention_mask']
+        
+        aspects = [] # ner
+        opinions = [] # ner
+        polaritys = [] # sentence level SA
+        
+        dataset['quad_index'].append([len(quads), len(quads) + len(item['comment'])])
+        for comment in item['comment']: # 每个 comment 是一个四元组，描述一个方面
+            category = category_dict[comment['aspect']]
+            polarity = polarity_dict[comment['polarity']]
+            for aspect, opinion in itertools.product(comment['target'], comment['opinion']):
+                quads['aspects'].append([aspect['head'], aspect['tail']])
+                quads['opinions'].append([opinion['head'], opinion['tail']])
+                quads['category'].append(category)
+                quads['polarity'].append(polarity)
+                quads['index'].append(idx)
+
+            aspects += comment['target']
+            opinions += comment['opinion']
+            polaritys.append(polarity)
+        ner_tags = tag_comment(tokens, aspects, opinions) + ['O'] * (sen_len - len(tokens))
+        ner_tag_ids = [tag_dict[i] for i in ner_tags]
+        sen_polarity = sentence_polarity(polaritys)
+        # sen_polarity = item['user_star']
+        
+        dataset['token_ids'].append(token_ids)
+        dataset['token_masks'].append(token_masks)
+        dataset['ner_tag_ids'].append(ner_tag_ids)
+        dataset['sen_polarity'].append(sen_polarity)
+    
+    dataset['token_ids'] = torch.tensor(dataset['token_ids'], dtype = int)
+    dataset['token_masks'] = torch.tensor(dataset['token_masks'], dtype = int)
+    dataset['ner_tag_ids'] = torch.tensor(dataset['ner_tag_ids'], dtype = int)
+    dataset['sen_polarity'] = torch.tensor(dataset['sen_polarity'], dtype = int)
+    dataset['quad_index'] = torch.tensor(dataset['quad_index'], dtype = int) # (n_dataset, 2)
+    quads['aspects'] = torch.tensor(quads['aspects'], dtype = int)
+    quads['opinions'] = torch.tensor(quads['opinions'], dtype = int)
+    quads['category'] = torch.tensor(quads['category'], dtype = int)
+    quads['polarity'] = torch.tensor(quads['polarity'], dtype = int)
+    quads['index'] = torch.tensor(quads['index'], dtype = int)
+    return dataset, quads
+
+class CommentDataset(Dataset):
+    def __init__(self, args, datas, vocabs):
+        super().__init__()
+        self.args = args
+        self.batch_size = args['batch_size']
+        self.dataset, self.quads = create_quads(args, datas, vocabs)
+
+    def __len__(self):
+        return int(np.ceil(len(self.dataset['token_ids']) / self.batch_size))
+    
+    def __getitem__(self, index):
+        return self.get_batch(index)
+
+    def get_batch(self, index):
+        begin = index * self.batch_size
+        end = min((index + 1) * self.batch_size, len(self.dataset['token_ids']))
+        
+        token_masks = self.dataset['token_masks'][begin: end]
+        sen_len = torch.max(torch.sum(token_masks, dim = 1))
+        
+        token_ids = self.dataset['token_ids'][begin: end, :sen_len].cuda()
+        token_masks = token_masks[:, :sen_len].cuda()
+        ner_tag_ids = self.dataset['ner_tag_ids'][begin: end, :sen_len].cuda()
+        sen_polarity = self.dataset['sen_polarity'][begin: end].cuda()
+        quad_index = self.dataset['quad_index'][begin: end].cuda() # 每句对应的 Quad 的范围(是否需要？)
+
+        quad_begin = self.dataset['quad_index'][begin][0]
+        quad_end = self.dataset['quad_index'][end][1]
+        
+        quad_aspects = self.quads['aspects'][quad_begin: quad_end].cuda()
+        quad_opinions = self.quads['opinions'][quad_begin: quad_end].cuda()
+        quad_category = self.quads['category'][quad_begin: quad_end].cuda()
+        quad_polarity = self.quads['polarity'][quad_begin: quad_end].cuda()
+        quad_sentence = (self.quads['index'][quad_begin: quad_end] - begin).cuda() # quad 对应的句子
+
+        return token_ids, token_masks, ner_tag_ids, sen_polarity, quad_index, \
+               quad_aspects, quad_opinions, quad_category, quad_polarity, quad_sentence
+
+def load_dataset(args):
+    dataset, vocabs = get_comment_data()
+    n_train, n_dev = int(0.6 * len(dataset)), int(0.2 * len(dataset))
+    train_set = CommentDataset(args, dataset[:n_train], vocabs)
+    dev_set = CommentDataset(args, dataset[n_train: n_train + n_dev], vocabs)
+    test_set = CommentDataset(args, dataset[n_train + n_dev:], vocabs)
+    print(len(train_set), len(dev_set), len(test_set))
+    return train_set, dev_set, test_set, vocabs
+
+def vocab_args(args, vocabs):
+    args['num_ner_tag'] = len(vocabs['tag_dict'])
+    args['num_category'] = len(vocabs['category_dict'])
+    args['num_polarity'] = len(vocabs['polarity_dict'])
+    return args
+
+if __name__ == '__main__':
+    # tokens = '要使用预训练的模型，我们需要将输入数据转换成合适的格式，以便每个句子都可以发送到预训练的模型中，从而获得相应的嵌入。'
+    # tokenizer = BertTokenizer.from_pretrained('/data/pretrained/bert-base-chinese/')
+    # bert_tokens = tokenizer(tokens, padding = 'max_length', truncation = True, max_length = 40)
+    # print(bert_tokens)
+    # print(len(bert_tokens['input_ids']))
+
+    with open('./Dataset/comment_labeled.json', 'r') as f:
+        for line in f:
+            data = json.loads(line)
+            comment_id = data['comment_id']
+            comment_variety = data['comment_variety'] # 花生
+            user_star = data['user_star'] # 2
+            comment_text = data['comment_text']
+            comment_units = data['comment_units'] # 多个四元组
+            for comment in comment_units:
+                print(comment)
+            break
+    
+    # args = {
+    #     'batch_size': 8,
+    #     'max_sen_len': 40,
+    #     'ner_model': 'bert',
+    # }
+    # train_set, dev_set, test_set, vocabs = load_dataset(args)
+    # for i in range(len(train_set)):
+    #     try:
+    #         batch = train_set.get_batch(i)
+    #     except:
+    #         print('err: ', i)
+    #         continue
+    #     # break
+    # print(i)
 
